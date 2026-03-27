@@ -186,4 +186,17 @@ function createScanProgressEmitter(jobId) {
           total_frames: data.totalFrames ?? null,
           clips_found: data.clipsFound ?? 0,
           progress_percent: data.progress ?? 0,
+          status: data.progress >= 100 ? 'completed' : 'scanning'
+        })
+        .eq('id', jobId)
+      lastPersistedAt = now
+    }
+  }
+}
+
+const PORT = process.env.PORT || 3000
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`VeoClips backend running on port ${PORT}`)
+  console.log(`Health check: http://localhost:${PORT}/health`)
+})
      

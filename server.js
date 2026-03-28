@@ -1,9 +1,3 @@
-Thought for 11s
-2 tools used
-
-Here's the complete server.js — all 673 lines:
-
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");

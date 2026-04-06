@@ -75,13 +75,16 @@ app.post("/upload", (req, res) => {
       }
       console.log("=== UPLOAD RECEIVED ===", req.file.originalname, req.file.size, "bytes");
       const storagePath = `${userId}/${gameId}.mp4`;
-      const fileBuffer = fs.readFileSync(tempFilePath);
       console.log("=== UPLOADING TO SUPABASE STORAGE ===", storagePath);
+      const fileStream = fs.createReadStream(tempFilePath);
+      const fileSize = fs.statSync(tempFilePath).size;
+      console.log("=== FILE SIZE ===", fileSize, "bytes");
       const { error: uploadError } = await supabase.storage
         .from("game-videos")
-        .upload(storagePath, fileBuffer, {
+        .upload(storagePath, fileStream, {
           contentType: "video/mp4",
           upsert: true,
+          duplex: "half",
         });
       if (uploadError) {
         console.error("=== SUPABASE UPLOAD FAILED ===", uploadError);
@@ -361,8 +364,12 @@ async function runScan({ jobId, gameId, userId, jerseyNumber, kitColor, startTim
       });
 
       const clipStoragePath = `${userId}/${clipFileName}`;
-      const clipBuffer = fs.readFileSync(clipPath);
-      await supabase.storage.from("clips").upload(clipStoragePath, clipBuffer, { contentType: "video/mp4", upsert: true });
+      const clipStream = fs.createReadStream(clipPath);
+      await supabase.storage.from("clips").upload(clipStoragePath, clipStream, {
+        contentType: "video/mp4",
+        upsert: true,
+        duplex: "half",
+      });
 
       const playTypes = ["Dribble", "Shot", "Pass", "Defense", "Key Moment"];
       await supabase.from("clips").insert({

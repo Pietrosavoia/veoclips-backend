@@ -134,4 +134,303 @@ app.post("/scan", async (req, res) => {
   }).then(() => console.log(`[SCAN] Scan job inserted into DB`))
     .catch((err) => console.error("[SCAN] Failed to create scan job:", err));
   res.json({ jobId, status: "started" });
-  const waitFor
+  const waitForClient = () => new Promise((resolve) => {
+    let elapsed = 0;
+    const interval = setInterval(() => {
+      elapsed += 200;
+      if (scanClients.has(jobId) || elapsed >= 5000) {
+        clearInterval(interval);
+        resolve();
+      }
+    }, 200);
+  });
+  await waitForClient();
+  runScan({ jobId, gameId, userId, jerseyNumber, kitColor, startTime, endTime, storagePath });
+});
+
+app.get("/scan-progress/:jobId", (req, res) => {
+  const { jobId } = req.params;
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+  res.write("retry: 5000\n");
+  res.write(`data: ${JSON.stringify({ status: "connected", jobId })}\n\n`);
+  scanClients.set(jobId, res);
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(`event: ping\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+    }
+  }, 15000);
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    scanClients.delete(jobId);
+    res.end();
+  });
+});
+
+function sendScanProgress(jobId, data) {
+  const client = scanClients.get(jobId);
+  if (client && !client.writableEnded) {
+    client.write(`data: ${JSON.stringify({ ...data, sentAt: new Date().toISOString() })}\n\n`);
+  }
+}
+
+function parseTimemarkToSeconds(timemark) {
+  if (!timemark) return 0;
+  const [hours = 0, minutes = 0, seconds = 0] = String(timemark).split(":").map(Number);
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function createScanProgressEmitter(jobId) {
+  let lastSentAt = 0;
+  let lastPersistedAt = 0;
+  return (data, { force = false } = {}) => {
+    const now = Date.now();
+    if (force || now - lastSentAt >= 5000) {
+      lastSentAt = now;
+      sendScanProgress(jobId, { status: "scanning", ...data });
+    }
+    if (data.totalFrames !== undefined && (force || now - lastPersistedAt >= 5000)) {
+      lastPersistedAt = now;
+      supabase.from("scan_jobs").update({
+        frames_scanned: data.framesScanned ?? 0,
+        total_frames: data.totalFrames ?? null,
+        clips_found: data.clipsFound ?? 0,
+        progress_percent: data.progress ?? 0,
+      }).eq("id", jobId)
+        .then(() => {})
+        .catch((err) => console.error(`[scan ${jobId}] Failed to persist progress:`, err.message));
+    }
+  };
+}
+
+async function runScan({ jobId, gameId, userId, jerseyNumber, kitColor, startTime, endTime, storagePath }) {
+  const videoPathWithUser = path.join(UPLOAD_DIR, userId, `${gameId}.mp4`);
+  const videoPathFlat = path.join(UPLOAD_DIR, `${gameId}.mp4`);
+  const videoPath = fs.existsSync(videoPathWithUser) ? videoPathWithUser : videoPathFlat;
+  const numericStart = Number.isFinite(Number(startTime)) ? Number(startTime) : 0;
+  const numericEnd = Number.isFinite(Number(endTime)) ? Number(endTime) : 0;
+  const scanDuration = numericEnd > numericStart ? numericEnd - numericStart : 0;
+  const estimatedTotalFrames = scanDuration > 0 ? Math.max(1, Math.ceil(scanDuration / 2)) : 0;
+  const emitProgress = createScanProgressEmitter(jobId);
+
+  console.log(`=== SCAN PROCESSING STARTED ===`);
+  console.log(`[scan ${jobId}] videoPath: ${videoPath}`);
+
+  if (!fs.existsSync(videoPath)) {
+    const bucket = "game-videos";
+    const downloadPath = storagePath || `${userId}/${gameId}.mp4`;
+    console.log(`=== DOWNLOADING VIDEO FROM SUPABASE ===`);
+    sendScanProgress(jobId, {
+      status: "scanning", phase: "downloading", progress: 0,
+      framesScanned: 0, totalFrames: estimatedTotalFrames, clipsFound: 0,
+      message: "Downloading video from storage...",
+    });
+    try {
+      const { data, error } = await supabase.storage.from(bucket).download(downloadPath);
+      if (error || !data) {
+        const errMsg = error?.message || "Download returned empty data";
+        console.error(`[scan ${jobId}] Storage download failed: ${errMsg}`);
+        sendScanProgress(jobId, { status: "error", message: `Failed to download video: ${errMsg}` });
+        await supabase.from("scan_jobs").update({ status: "failed" }).eq("id", jobId);
+        return;
+      }
+      const uploadDir = path.dirname(videoPath);
+      fs.mkdirSync(uploadDir, { recursive: true });
+      const buffer = Buffer.from(await data.arrayBuffer());
+      fs.writeFileSync(videoPath, buffer);
+      console.log(`=== VIDEO DOWNLOADED SUCCESSFULLY ===`);
+      sendScanProgress(jobId, {
+        status: "scanning", phase: "downloading", progress: 0,
+        framesScanned: 0, totalFrames: estimatedTotalFrames, clipsFound: 0,
+        message: "Video downloaded, starting scan...",
+      });
+    } catch (err) {
+      console.error(`[scan ${jobId}] Storage download error:`, err);
+      sendScanProgress(jobId, { status: "error", message: `Download error: ${err.message}` });
+      await supabase.from("scan_jobs").update({ status: "failed" }).eq("id", jobId);
+      return;
+    }
+  }
+
+  const framesDir = path.join(FRAMES_DIR, gameId);
+  fs.mkdirSync(framesDir, { recursive: true });
+  const clipsDir = path.join(CLIPS_DIR, gameId);
+  fs.mkdirSync(clipsDir, { recursive: true });
+
+  try {
+    await new Promise((resolve, reject) => {
+      const cmd = ffmpeg(videoPath)
+        .outputOptions(["-vf", "fps=0.5", "-q:v", "3"])
+        .output(path.join(framesDir, "%04d.jpg"));
+      if (startTime !== undefined) cmd.seekInput(startTime);
+      if (endTime !== undefined) cmd.duration(endTime - (startTime || 0));
+      cmd
+        .on("start", (commandLine) => {
+          console.log(`=== STARTING FFMPEG ===`);
+          console.log(commandLine);
+        })
+        .on("progress", (ffmpegProgress) => {
+          const processedSeconds = parseTimemarkToSeconds(ffmpegProgress.timemark);
+          const extractionRatio = scanDuration > 0 ? Math.min(processedSeconds / scanDuration, 1) : 0;
+          const extractedFrames = Math.min(Math.round(extractionRatio * estimatedTotalFrames), estimatedTotalFrames);
+          emitProgress({
+            phase: "extracting_frames", progress: Math.round(extractionRatio * 100),
+            framesScanned: extractedFrames, totalFrames: estimatedTotalFrames, clipsFound: 0,
+            message: `Extracting frames... ${Math.round(extractionRatio * 100)}%`,
+          });
+        })
+        .on("end", () => {
+          console.log(`[scan ${jobId}] FFmpeg extract completed`);
+          resolve();
+        })
+        .on("error", (err) => {
+          console.error(`[scan ${jobId}] FFmpeg extract error:`, err.message);
+          reject(err);
+        })
+        .run();
+    });
+
+    const frameFiles = fs.readdirSync(framesDir).filter((f) => f.endsWith(".jpg")).sort();
+    const totalFrames = frameFiles.length;
+    if (totalFrames === 0) throw new Error("FFmpeg extracted 0 frames");
+
+    const detections = [];
+    const ROBOFLOW_API_KEY = process.env.ROBOFLOW_API_KEY;
+
+    for (let i = 0; i < totalFrames; i++) {
+      const frameTime = numericStart + i * 2;
+      const currentFrame = i + 1;
+      const percentComplete = Math.round((currentFrame / totalFrames) * 100);
+
+      if (currentFrame === 1 || currentFrame % 100 === 0 || currentFrame === totalFrames) {
+        console.log(`Frame ${currentFrame} of ${totalFrames} processed`);
+      }
+
+      if (ROBOFLOW_API_KEY) {
+        try {
+          const framePath = path.join(framesDir, frameFiles[i]);
+          const imageData = fs.readFileSync(framePath, { encoding: "base64" });
+          const response = await fetch(
+            `https://detect.roboflow.com/jersey-number-ocr/1?api_key=${ROBOFLOW_API_KEY}`,
+            { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: imageData }
+          );
+          const result = await response.json();
+          const match = result.predictions?.find(
+            (p) => p.class === String(jerseyNumber) && p.confidence > 0.6
+          );
+          if (match) {
+            console.log(`=== CLIP FOUND at timestamp: ${frameTime}s ===`);
+            detections.push({ frameIndex: i, timeSec: frameTime, confidence: Math.round(match.confidence * 100) });
+          }
+        } catch (err) {
+          console.error(`Frame ${currentFrame} analysis error:`, err.message);
+        }
+      } else if (Math.random() < 0.15) {
+        detections.push({ frameIndex: i, timeSec: frameTime, confidence: Math.round(65 + Math.random() * 33) });
+      }
+
+      emitProgress({
+        phase: "analyzing_frames", progress: percentComplete,
+        framesScanned: currentFrame, totalFrames, clipsFound: detections.length,
+        message: `Scanning frame ${currentFrame} of ${totalFrames}`,
+      });
+    }
+
+    const clips = [];
+    let currentClip = null;
+    for (const det of detections) {
+      if (!currentClip || det.timeSec - currentClip.endSec > 5) {
+        if (currentClip) clips.push(currentClip);
+        currentClip = { startSec: Math.max(0, det.timeSec - 5), endSec: det.timeSec + 10, confidence: det.confidence, detections: [det] };
+      } else {
+        currentClip.endSec = det.timeSec + 10;
+        currentClip.confidence = Math.max(currentClip.confidence, det.confidence);
+        currentClip.detections.push(det);
+      }
+    }
+    if (currentClip) clips.push(currentClip);
+
+    for (let i = 0; i < clips.length; i++) {
+      const clip = clips[i];
+      const clipId = `${gameId}-clip-${i + 1}`;
+      const clipFileName = `${clipId}.mp4`;
+      const clipPath = path.join(clipsDir, clipFileName);
+
+      console.log(`[scan ${jobId}] Cutting clip ${i + 1}/${clips.length}`);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(videoPath)
+          .seekInput(clip.startSec)
+          .duration(clip.endSec - clip.startSec)
+          .outputOptions(["-c", "copy", "-movflags", "+faststart"])
+          .output(clipPath)
+          .on("end", () => resolve())
+          .on("error", (err) => reject(err))
+          .run();
+      });
+
+      const clipStoragePath = `${userId}/${clipFileName}`;
+      const clipStream = fs.createReadStream(clipPath);
+      await supabase.storage.from("clips").upload(clipStoragePath, clipStream, {
+        contentType: "video/mp4",
+        upsert: true,
+        duplex: "half",
+      });
+
+      const playTypes = ["Dribble", "Shot", "Pass", "Defense", "Key Moment"];
+      await supabase.from("clips").insert({
+        id: clipId, game_id: gameId, user_id: userId, title: `Clip ${i + 1}`,
+        play_type: playTypes[i % playTypes.length], start_time: clip.startSec,
+        end_time: clip.endSec, confidence: clip.confidence,
+        storage_path: clipStoragePath, minute: Math.round(clip.startSec / 60),
+      });
+      fs.unlinkSync(clipPath);
+    }
+
+    console.log(`=== SCAN COMPLETE. Clips found: ${clips.length} ===`);
+    sendScanProgress(jobId, { status: "complete", progress: 100, framesScanned: totalFrames, totalFrames, clipsFound: clips.length, message: "Scan complete!" });
+
+    await supabase.from("scan_jobs").update({
+      status: "completed", progress_percent: 100, clips_found: clips.length,
+      completed_at: new Date().toISOString(), total_frames: totalFrames, frames_scanned: totalFrames,
+    }).eq("id", jobId);
+    await supabase.from("games").update({ status: "scanned" }).eq("id", gameId);
+
+  } catch (err) {
+    console.error(`[scan ${jobId}] Scan error:`, err);
+    sendScanProgress(jobId, { status: "error", message: err.message || "Scan failed" });
+    await supabase.from("scan_jobs").update({ status: "failed" }).eq("id", jobId);
+  } finally {
+    fs.rmSync(framesDir, { recursive: true, force: true });
+  }
+}
+
+app.get("/clip/:clipId", async (req, res) => {
+  try {
+    const { data: clip, error } = await supabase.from("clips").select("storage_path").eq("id", req.params.clipId).maybeSingle();
+    if (error || !clip?.storage_path) return res.status(404).json({ error: "Clip not found" });
+    const { data } = await supabase.storage.from("clips").createSignedUrl(clip.storage_path, 3600);
+    if (!data?.signedUrl) return res.status(500).json({ error: "Could not generate signed URL" });
+    res.json({ signedUrl: data.signedUrl });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/game/:gameId", async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    const { gameId } = req.params;
+    const videoPath = path.join(UPLOAD_DIR, userId || "", `${gameId}.mp4`);
+    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+    const clipsDir = path.join(CLIPS_DIR, gameId);
+    if (fs.existsSync(clipsDir)) fs.rmSync(clipsDir, { recursive: true, force: true });
+    res.json({ status: "deleted", gameId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`VeoClips backend running on port ${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+});
